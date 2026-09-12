@@ -1,0 +1,25 @@
+# dsh-campus-hunt bundle 层：挂载校招求职插件。
+# Host 半场（lib/index.js）：v0.1 SFE2 注册 job_track；M2 再加
+# campus_job_search / campus_job_detail / campus_schedule 三个 tool 与
+# campus-hunt skill。
+# Client 半场（lib/client.js）：v0.1 SFE1 空 apply；M3 注册
+# 三 tab 卡片（岗位列表 / 详情 / 投递追踪）；v0.1.1 SFE17 卡片挂
+# conversation.chat.node 会话节点（回答区，key='campus-cards'）。
+- insert:
+    - id: dsh-campus-hunt
+      name: 'dsh-campus-hunt'
+      # v0.1 SFE6：entry 配置 = settings namespace campus-hunt 的 base 层
+      # （与 src/config.ts defaultConfig 同值；用户改动落 $DSH_HOME/settings.yaml）。
+      config:
+        profile:
+          directions: []
+          cities: []
+          targetCompanies: []
+        resumePath: ''
+        # v0.1.1 SFE11：牛客秋招专场页 URL（备用路线直开入口）。
+        specialUrl: 'https://www.nowcoder.com/jobs/activity/v2/special-activity/index/2027QZzc'
+        collection:
+          allowedDomains:
+            - nowcoder.com
+          maxItemsPerRun: 50
+          minIntervalMs: 1000
