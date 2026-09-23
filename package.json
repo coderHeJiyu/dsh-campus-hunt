@@ -1,6 +1,6 @@
 {
   "name": "dsh-campus-hunt",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "DSH 校招求职 Client 插件：4 个 host tool（岗位检索 / JD 详情 / 校招日程 / 投递流水线）+ 回答区 GUI 三 tab 卡片，本地优先数据层，只读采集",
   "type": "module",
   "main": "./lib/index.js",

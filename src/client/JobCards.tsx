@@ -30,8 +30,15 @@
  * 最小结构接口（与 records.ts / session.ts 对齐）。
  *
  * 样式遵循 DSH 外部插件惯例：内联样式、内联中文、透明底、无 locale。
+ *
+ * v0.1.3：PTC 文件分支——PTC 工具呈现下 host 不对子调用投影
+ * presentationMeta（block.meta 缺席），且 content 是人类可读文本而非规范值
+ * JSON，parseCard 必落 generic 行。规范值的唯一无损来源 = 会话 workspace
+ * 文件：meta 缺席且 loader 可用（inject 面 loadWorkspaceFile，见 index.tsx）
+ * 时，活读 jobs.json / track.json / schedule.json，构造规范值，复用同一卡片
+ * 体（CardBody）；任何失败回退 generic 行，native 呈现（meta 在）不受影响。
  */
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { CSSProperties, ReactElement } from 'react'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,6 +130,8 @@ export interface JobCardsProps {
   inspect?: () => void
   /** 动作 prompt 通道（inject 面产物，见 index.tsx）；缺失时动作按钮禁用。 */
   sendPrompt?: (text: string) => void
+  /** v0.1.3 PTC 文件分支：会话 workspace 文件加载器（inject 面产物，见 index.tsx）；缺席不进文件分支。 */
+  loadWorkspaceFile?: (path: string) => Promise<string | null>
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -288,6 +297,98 @@ function parseCanonical(tool: string, kind: CardKind, v: Record<string, unknown>
     }
   }
   return base
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PTC 文件分支（v0.1.3；纯函数，可直接单测）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** kind → 会话 workspace 文件名（store 层三个数据文件，见 src/data/store.ts）。 */
+export function ptcFileForKind(kind: CardKind): string {
+  if (kind === 'tracks') return 'track.json'
+  if (kind === 'schedule') return 'schedule.json'
+  return 'jobs.json' // jobs / job 共用岗位库
+}
+
+/**
+ * PTC 文件分支门禁（全部满足才进）：block 已落定、isError false、meta 缺席
+ * （= PTC 呈现；native 恒有 meta）、工具为 4 个 campus 卡之一、loader 可用。
+ */
+export function ptcFileGate(tool: string, block: ToolCallBlockLike, hasLoader: boolean): boolean {
+  if (!('kind' in block)) return false
+  const settled = block as ToolResultNodeLike
+  if (settled.isError) return false
+  if (asRecord(settled.meta) !== null) return false
+  const kind = KIND_BY_TOOL[tool]
+  if (kind === undefined) return false
+  return hasLoader
+}
+
+/** 从 PTC dispatch 的 argsRaw 提取非空 jobId 字符串；缺席 / 畸形 / 非 JSON → null。 */
+function ptcJobIdFromArgs(argsRaw: string | undefined): string | null {
+  if (argsRaw === undefined || argsRaw.length === 0) return null
+  try {
+    const r = asRecord(JSON.parse(argsRaw))
+    return r === null ? null : str(r.jobId)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 会话 workspace 文件文本 → 规范值（字段名对齐 parseCanonical 期望）：先解
+ * store 信封（{ schema, data } → data，容忍裸对象），再按 kind 构造：
+ * - jobs:     { jobs }（数组，缺失 → null）
+ * - tracks:   { tracks, summary: { byStatus: 按 track.status 计数, total: tracks.length } }
+ * - schedule: { items, source: 首项 source（string，缺失 → ''）}（文件无顶层 source）
+ * - job:      需 argsRaw（jobId），jobs 中按 id 找 → { job, jobId }；未找到 → null
+ * JSON 解析失败 / 根非对象 / data 非对象 → null；逐元素校验由 parseCanonical
+ * 既有检查兜底（本函数只做构造）。
+ */
+export function ptcCanonicalFromFile(
+  kind: CardKind,
+  fileText: string,
+  argsRaw?: string,
+): Record<string, unknown> | null {
+  let root: unknown
+  try {
+    root = JSON.parse(fileText)
+  } catch {
+    return null
+  }
+  const obj = asRecord(root)
+  if (obj === null) return null
+  const data = asRecord(obj.data) ?? obj
+  switch (kind) {
+    case 'jobs': {
+      if (!Array.isArray(data.jobs)) return null
+      return { jobs: data.jobs }
+    }
+    case 'tracks': {
+      if (!Array.isArray(data.tracks)) return null
+      const tracks = data.tracks as unknown[]
+      const byStatus: Record<string, number> = {}
+      for (const t of tracks) {
+        const s = str(asRecord(t)?.status)
+        if (s !== null) byStatus[s] = (byStatus[s] ?? 0) + 1
+      }
+      return { tracks, summary: { byStatus, total: tracks.length } }
+    }
+    case 'schedule': {
+      if (!Array.isArray(data.items)) return null
+      const items = data.items as unknown[]
+      const source = str(asRecord(items[0])?.source) ?? ''
+      return { items, source }
+    }
+    case 'job': {
+      const jobId = ptcJobIdFromArgs(argsRaw)
+      if (jobId === null) return null
+      if (!Array.isArray(data.jobs)) return null
+      const found = (data.jobs as unknown[]).find(x => asRecord(x)?.id === jobId)
+      if (found === undefined) return null
+      return { job: found, jobId }
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -569,17 +670,35 @@ function JobCardsInner(props: JobCardsProps): ReactElement {
 
   // 动作通道（inject 面产物）：undefined → 三个动作按钮禁用。
   const send = props.sendPrompt ?? null
+  // v0.1.3 PTC 文件分支 loader（inject 面产物）：缺席 → 不进文件分支。
+  const loader = props.loadWorkspaceFile
+  const hasLoader = loader !== undefined
+
+  const parsed = parseCard(toolName, block)
+  if (parsed === null) {
+    if (!('kind' in block)) return <RunningRow toolName={toolName} block={block as RunningToolCallLike} />
+    // meta 缺席（= PTC 呈现）+ loader 可用 → 活读会话 workspace 文件、
+    // 构造规范值、复用卡片体；任何失败回退 generic 行；native（meta 在）
+    // 不进此分支。
+    if (hasLoader && ptcFileGate(toolName, block, hasLoader)) {
+      return <PtcFileCard toolName={toolName} block={block as ToolResultNodeLike} loadWorkspaceFile={loader} send={send} />
+    }
+    return <GenericRow toolName={toolName} block={block as ToolResultNodeLike} />
+  }
+  return <CardBody parsed={parsed} send={send} />
+}
+
+/**
+ * 卡片体（v0.1.3 提取；native meta / content 规范值 / PTC 文件分支三路共享）：
+ * 四个 state hooks 随体走；渲染 JSX 为原 JobCardsInner 卡片体原样搬移。
+ */
+function CardBody(props: { parsed: ParsedCard; send: ((text: string) => void) | null }): ReactElement {
+  const { parsed, send } = props
 
   const [activeTab, setActiveTab] = useState(0)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [localStatus, setLocalStatus] = useState<Record<string, string>>({})
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({})
-
-  const parsed = parseCard(toolName, block)
-  if (parsed === null) {
-    if (!('kind' in block)) return <RunningRow toolName={toolName} block={block as RunningToolCallLike} />
-    return <GenericRow toolName={toolName} block={block as ToolResultNodeLike} />
-  }
 
   const rows = rowsOf(parsed)
   const selectRow = (key: string): void => {
@@ -687,6 +806,62 @@ function JobCardsInner(props: JobCardsProps): ReactElement {
       )}
     </div>
   )
+}
+
+/**
+ * v0.1.3 PTC 文件分支：活读会话 workspace 文件（loader = inject 面产物）→
+ * 构造规范值 → 复用 CardBody。加载态 = 最小行（无 tab）；任何失败（loader
+ * throw / 文件缺席 / 非 JSON / 构造或校验失败）→ GenericRow 兜底，永不白屏。
+ */
+function PtcFileCard(props: {
+  toolName: string
+  block: ToolResultNodeLike
+  loadWorkspaceFile: (path: string) => Promise<string | null>
+  send: ((text: string) => void) | null
+}): ReactElement {
+  const { toolName, block, loadWorkspaceFile, send } = props
+  // 门禁已验证 toolName 为 4 个 campus 工具之一。
+  const kind = KIND_BY_TOOL[toolName]
+  const argsRaw = block.call !== null ? block.call.argsRaw : undefined
+  // job 时 jobId 必须先从 argsRaw 同步解析：不可用 → 直接 generic 行，不发请求。
+  const jobId = ptcJobIdFromArgs(argsRaw)
+  const immediateGeneric = kind === 'job' && jobId === null
+
+  const [state, setState] = useState<'loading' | ParsedCard | null>('loading')
+
+  // 已落定 block 不可变：挂载时读一次文件（cancelled 标志防卸载竞态）。
+  useEffect(() => {
+    if (immediateGeneric) return
+    let cancelled = false
+    loadWorkspaceFile(ptcFileForKind(kind))
+      .then(fileText => {
+        if (cancelled) return
+        if (fileText === null) { setState(null); return }
+        const canonical = ptcCanonicalFromFile(kind, fileText, argsRaw)
+        if (canonical === null) { setState(null); return }
+        setState(parseCanonical(toolName, kind, canonical))
+      })
+      .catch(() => {
+        if (!cancelled) setState(null) // loader throw / reject → generic 行兜底
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  if (immediateGeneric) return <GenericRow toolName={toolName} block={block} />
+  if (state === 'loading') {
+    return (
+      <div style={cardStyle}>
+        <div style={headerStyle}>
+          <span style={iconStyle}>✦</span>
+          <span style={titleStyle}>{TITLE_BY_KIND[kind]}</span>
+          <span style={dotStyle('#4dbd74')} />
+          <span style={mutedStyle}>卡片加载…</span>
+        </div>
+      </div>
+    )
+  }
+  if (state === null) return <GenericRow toolName={toolName} block={block} />
+  return <CardBody parsed={state} send={send} />
 }
 
 function JdSection(props: {

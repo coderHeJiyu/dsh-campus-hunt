@@ -1,5 +1,5 @@
 /**
- * dsh-campus-hunt · client 半场入口（v0.1 / v0.1.1）。
+ * dsh-campus-hunt · client 半场入口（v0.1 / v0.1.1 / v0.1.3）。
  *
  * v0.1.1：校招岗位卡片由工具调用行迁移至「正式回答区」——注册
  * 自定义会话节点 campus-cards（数据面 `ctx.uiConversation.events.register`
@@ -10,6 +10,17 @@
  * （campus_job_search / campus_job_detail / campus_schedule / job_track）
  * 的已落定结果同口径汇入一张尾卡（卡片分支由 block.meta.card
  * 或 content 规范值 JSON 决定）。
+ *
+ * v0.1.3：卡片支持 PTC 工具呈现——host 以 presentAs('ptc') 呈现工具时
+ * 顶层只暴露 run_code，4 个 campus 工具被 pack 成 run_code 内的
+ * tool/ptc-dispatch；数据面双注册（per-turn 节点 + state-only 卫星
+ * campusCardsPtcDefinition，见 campus-cards.ts）：卫星经 step 作用域
+ * 发布 Location 数据，per-turn 节点在 turn/end 聚合。native 呈现行为
+ * 不变。渲染面增 PTC 文件分支：inject 面新增成员 loadWorkspaceFile(path)
+ * 经 workspace-files remote 面读会话 workspace 文件（base64 → UTF-8 文本），
+ * PTC 呈现 meta 缺席时卡片活读 jobs.json / track.json / schedule.json 重建
+ * 规范值并复用卡片体（见 JobCards.tsx）；remote 面缺席 / 读取失败 → null →
+ * 回退 generic 行，native 不受影响。
  *
  * v0.1：另在 `settings.section` 槽注册设置页卡片（CampusHuntSection，
  * 见 settings.tsx）——经 `ctx.settingsScope.bind({ namespace })` 建单例
@@ -41,7 +52,12 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 
-import { campusCardsDefinition, type CampusCardsDefinition } from './campus-cards.ts'
+import {
+  campusCardsDefinition,
+  campusCardsPtcDefinition,
+  type CampusCardsDefinition,
+  type CampusPtcDefinition,
+} from './campus-cards.ts'
 import { CampusCardsView } from './CampusCardsView.tsx'
 import { CampusHuntSection, isOverridden, jsonEqual } from './settings.tsx'
 import type { SettingsSectionInject, TopField, WriteOutcome } from './settings.tsx'
@@ -65,7 +81,7 @@ declare module '@deepseek-ai/cordis' {
            * sessionId 作为工厂首参；root-scope 槽（settings.section）：
            * 零参工厂。
            */
-          inject?: ((sessionId: string) => { sendPrompt: (text: string) => void }) | (() => SettingsSectionInject)
+          inject?: ((sessionId: string) => { sendPrompt: (text: string) => void; loadWorkspaceFile: (path: string) => Promise<string | null> }) | (() => SettingsSectionInject)
         },
         component: unknown,
       ): unknown
@@ -77,12 +93,13 @@ declare module '@deepseek-ai/cordis' {
     /**
      * 会话节点事件面（宿主 ui-conversation 提供，dsh-client-ui-conversation
      * 的 `ctx.uiConversation`）：`events.register(definition)` 注册
-     * conversation 节点 definition（回答区卡片的数据面，见 campus-cards.ts）。
-     * 缺席（非 UI 宿主）时跳过注册，同 slots 守卫口径。
+     * conversation 节点 definition（回答区卡片的数据面，见 campus-cards.ts；
+     * v0.1.3 双注册：per-turn 节点 + PTC 卫星）。缺席（非 UI 宿主）时
+     * 跳过注册，同 slots 守卫口径。
      */
     uiConversation?: {
       events: {
-        register(definition: CampusCardsDefinition): () => void
+        register(definition: CampusCardsDefinition | CampusPtcDefinition): () => void
       }
     }
   }
@@ -106,14 +123,34 @@ interface SessionsFace {
   } | undefined
 }
 
+/** 最小 remote 结果（生成 remote 面的 RemoteResult；本插件不装 dsh-api-workspace-files，同 SessionsFace 自写口径）。 */
+type RemoteResultLike<T> = { ok: true; value: T } | { ok: false; error: unknown }
+
+/**
+ * 最小 workspace-files remote 面（签名出处 = workspaceFiles 命名空间生成的
+ * remote 面）：readAll(sessionId, path) 返回文件完整字节的 base64
+ * （WorkspaceFileBytes 子集，只取 value.data）。
+ */
+interface WorkspaceFilesFace {
+  readAll(sessionId: string, path: string, signal?: AbortSignal): Promise<RemoteResultLike<{ data: string }>>
+}
+
+/** 最小 remote 服务面（只读 workspaceFiles 命名空间，供 v0.1.3 PTC 文件分支）。 */
+interface RemoteFace {
+  workspaceFiles?: WorkspaceFilesFace
+}
+
 /**
  * client 半场注入声明：slots（卡片注册）+ sessions（动作 prompt 通道）
- * + settingsScope / remote（v0.1 设置页卡片，口径 8）+ uiConversation
- * （v0.1.1 回答区卡片的数据面注册）。
+ * + settingsScope / remote（v0.1 设置页卡片，口径 8）+ remote.workspaceFiles
+ * （v0.1.3 PTC 文件分支的活读通道；gateway client 按命名空间名注册该
+ * remote 命名空间）+ uiConversation（v0.1.1 回答区卡片的数据面注册；
+ * v0.1.3 增 PTC 卫星注册）。
  * remote 必须声明（SA-c1 决策：ui-theme 先例——settings-scope 的失效转发
- * 订在消费 ctx 的 remote 上）；本插件代码不直接访问 remote。
+ * 订在消费 ctx 的 remote 上）；v0.1.3：inject 面 loadWorkspaceFile 读
+ * workspace-files remote 面（PTC 文件分支，见 JobCards.tsx）。
  */
-export const inject = ['slots', 'sessions', 'settingsScope', 'remote', 'uiConversation']
+export const inject = ['slots', 'sessions', 'settingsScope', 'remote', 'remote.workspaceFiles', 'uiConversation']
 
 /**
  * 写编排超时（ms；v0.1 live 缺陷 A/B 修复 + 值条件等待；测试可改小，
@@ -145,7 +182,10 @@ export function apply(ctx: Context): void {
   const sessions = (ctx.get?.('sessions') ?? undefined) as SessionsFace | undefined
 
   /** 构造一个 session-scope inject 面：闭包捕获框架解析的 sessionId（单参形态）。 */
-  const injectFace = (sessionId: string): { sendPrompt: (text: string) => void } => ({
+  const injectFace = (sessionId: string): {
+    sendPrompt: (text: string) => void
+    loadWorkspaceFile: (path: string) => Promise<string | null>
+  } => ({
     sendPrompt(text: string): void {
       const face = sessions?.binding(sessionId)?.session
       if (face === undefined) return
@@ -158,14 +198,33 @@ export function apply(ctx: Context): void {
           // 避免产生未处理的 rejection。
         })
     },
+    // v0.1.3 PTC 文件分支：活读会话 workspace 文件（workspace-files remote
+    // 面，base64 → UTF-8 文本）；remote 面缺席 / 非 ok / 任何 throw → null
+    // （JobCards 侧回退 generic 行）。
+    async loadWorkspaceFile(path: string): Promise<string | null> {
+      const remote = (ctx.get?.('remote') ?? undefined) as RemoteFace | undefined
+      const ns = remote?.workspaceFiles
+      if (ns === undefined) return null
+      try {
+        const res = await ns.readAll(sessionId, path)
+        if (res.ok !== true) return null
+        const bytes = Uint8Array.from(atob(res.value.data), c => c.charCodeAt(0))
+        return new TextDecoder('utf-8').decode(bytes)
+      } catch {
+        return null // remote 调用 throw（含解码失败）→ null
+      }
+    },
   })
 
-  // ── 回答区卡片（v0.1.1）──
-  // 数据面：注册会话节点 definition（收集本回合 4 个 campus 工具的已落定
-  // 结果；面缺席——非 UI 宿主——跳过，同 slots 守卫口径）。
+  // ── 回答区卡片（v0.1.1；v0.1.3 增 PTC 卫星）──
+  // 数据面：注册 per-turn 会话节点 definition（收集本回合 4 个 campus 工具
+  // 的已落定结果）+ PTC 卫星 definition（state-only：收集 run_code 内 pack
+  // 的 campus 卡片并经 step 作用域发布 Location 数据，由 per-turn 节点在
+  // turn/end 聚合）。面缺席——非 UI 宿主——跳过，同 slots 守卫口径。
   const uiConversation = ctx.uiConversation
   if (uiConversation !== undefined) {
     uiConversation.events.register(campusCardsDefinition)
+    uiConversation.events.register(campusCardsPtcDefinition)
   }
   // 渲染面：session-scoped keyed 槽，key='campus-cards'（不在 host 键域）；
   // inject 面首参 = 框架解析的 sessionId（复用现有 sendPrompt 通道）。

@@ -5,7 +5,8 @@
  * 本回合的 Chat 节点（node.data.cards = 4 个 campus 工具已落定卡片，见
  * campus-cards.ts）+ Chat owner 面；本组件逐项渲染 JobCards（组件本体零
  * 改动：parseCard 分支 / 三 tab / 逐项校验 / GenericRow / CrashRow 全部
- * 复用），sendPrompt（inject 面产物）与 openFile / cwd 原样透传。
+ * 复用），sendPrompt / loadWorkspaceFile（inject 面产物，v0.1.3 PTC 文件
+ * 分支的会话 workspace 文件加载器）与 openFile / cwd 原样透传。
  *
  * 永不白屏：node 缺席 / cards 空 → 渲染 null（不产出行）；单项数据畸形或
  * 渲染 throw → 该项兜底最小 generic 行（JobCards 自带 try/catch，本层是
@@ -22,6 +23,8 @@ export interface CampusCardsViewProps {
   readonly node: { data: CampusCardsNodeData }
   /** 动作 prompt 通道（inject 面产物，见 index.tsx）；缺失时动作按钮禁用。 */
   readonly sendPrompt?: (text: string) => void
+  /** v0.1.3 PTC 文件分支：会话 workspace 文件加载器（inject 面产物，见 index.tsx）；缺席时卡片不进文件分支。 */
+  readonly loadWorkspaceFile?: (path: string) => Promise<string | null>
   /** host openFile（框架必传；本卡片不用，但 JobCardsProps 要求）。 */
   readonly openFile?: (path: string) => void
   /** host cwd（本卡片不用；透传）。 */
@@ -49,6 +52,7 @@ export function CampusCardsView(props: CampusCardsViewProps): ReactElement | nul
           key={`${card?.callId ?? 'unknown'}#${index}`}
           card={card}
           sendPrompt={props.sendPrompt}
+          loadWorkspaceFile={props.loadWorkspaceFile}
           openFile={openFile}
           cwd={props.cwd}
         />
@@ -62,6 +66,7 @@ function CardItem(props: {
   /** wire 数据不可信：null / undefined 条目按崩溃兜底处理（不连坐整列）。 */
   card: CampusCardEntry | null | undefined
   sendPrompt?: (text: string) => void
+  loadWorkspaceFile?: (path: string) => Promise<string | null>
   openFile: (path: string) => void
   cwd?: string
 }): ReactElement {
@@ -76,6 +81,7 @@ function CardItem(props: {
         openFile={props.openFile}
         cwd={props.cwd}
         sendPrompt={props.sendPrompt}
+        loadWorkspaceFile={props.loadWorkspaceFile}
       />
     )
   } catch (error) {
