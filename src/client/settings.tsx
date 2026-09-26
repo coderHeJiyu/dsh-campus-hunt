@@ -13,27 +13,28 @@
  * - 采集（collection）：allowedDomains tags + maxItemsPerRun number +
  *   minIntervalMs number。
  *
- * 读写通道（口径 7，v0.1）：
- * - 读一律经 `useScope` selector hook（框架把 inject `hooks.scope` 隔间的
- *   裸 observable 绑定为 useScope）；组件内禁手动 subscribe /
+ * 读写通道（v0.1.4，0.1.7 client 契约 D3）：
+ * - 读一律经 `useForm` selector hook（框架把 inject `hooks.form` 隔间的
+ *   裸 observable——ConfigForm——绑定为 useForm）；组件内禁手动 subscribe /
  *   useSyncExternalStore。
- * - 本地 draft 暂存（useState）：未保存不写 scope；分节保存按钮仅在该节
+ * - 本地 draft 暂存（useState）：未保存不写 form；分节保存按钮仅在该节
  *   有改动（dirty）时可用。
- * - 保存 = 逐顶层字段 `scope.set(field, value)`；恢复默认 =
- *   `scope.unset(field)`。写编排（快照期望值比对 → ok / rejected /
- *   stale / timeout 四态 + 连写值条件等待 + 写超时兜底，v0.1
- *   live 缺陷 A/B 修复）在 inject 工厂闭包里（index.tsx），组件只收
- *   setField / resetField 回调。
- * - 冲突自愈：任何非 ok 结果 → 提示条 + draft 归零（回到最新快照，服务端
- *   为事实源）。
+ * - 保存 = 逐顶层字段 `form.set(field, value)`；恢复默认 =
+ *   `form.unset(field)`（清 user 层回 base 继承）。setField / resetField
+ *   是 inject 工厂闭包里的薄封装（index.tsx）：透传 form 的
+ *   Promise<boolean>，transport 失败 reject 归一为 false。连写保序 /
+ *   revision fence / 失败镜像重读由 form 内建写队列承担（0.1.7
+ *   ConfigFormController），插件侧无自写写编排。
+ * - 未接受自愈：写返回 false（拒绝或跳写，form 已做 latest-write 恢复）→
+ *   提示条 + draft 归零（回到最新快照，服务端为事实源）。
  * - status loading / unavailable /（ready 但 value 未解码）各有独立展示；
  *   writable=false 显示只读提示条 + 表单（全部输入与按钮禁用），不白屏。
  * - 覆盖标记（「已自定义」徽章）：snapshot.user 分节存在性——值与 base
- *   相等的覆盖也是覆盖（settings-contract 注释：比较值看不见它）。
+ *   相等的覆盖也是覆盖（比较值看不见它）。
  *
  * 类型自写口径（同 JobCards.tsx）：本插件 node_modules 未装
  * @deepseek-ai/dsh-client-ui-settings，按 wire 形态自写最小结构接口
- * （SettingsScopeLike / ScopeSnapshotLike / ScopeSelectorHook）。
+ * （ConfigFormLike / ConfigFormSnapshotLike / FormSelectorHook）。
  */
 import { useEffect, useState } from 'react'
 import type { CSSProperties, ReactElement, ReactNode } from 'react'
@@ -46,52 +47,57 @@ import type { Config } from '../config.ts'
 /** campus-hunt namespace 的顶层字段（= Config 的四个顶层键）。 */
 export type TopField = 'profile' | 'resumePath' | 'specialUrl' | 'collection'
 
-/** 一次字段写/清的结果（index.tsx 的写编排判定，v0.1 四态）。 */
-export type WriteOutcome = 'ok' | 'rejected' | 'stale' | 'timeout'
-
 /**
- * 快照最小面（SettingsScopeSnapshot 结构子集）：status / value / base /
- * user / revision / writable / mode。
+ * 快照最小面（ConfigFormSnapshot 结构子集，0.1.7 ui-settings
+ * config-form-types.ts wire 形态）：status / value / base / user /
+ * revision / writable。
  */
-export interface ScopeSnapshotLike<T> {
+export interface ConfigFormSnapshotLike<T> {
   status: 'loading' | 'ready' | 'unavailable'
   value: T | undefined
   base: unknown
   user: unknown
   revision: number | undefined
   writable: boolean
-  mode: 'host' | 'memory'
 }
 
-/** scope 最小面（SettingsScope 结构子集：快照 + 订阅 + 字段写/清）。 */
-export interface SettingsScopeLike<T> {
-  getSnapshot(): ScopeSnapshotLike<T>
+/** 一个字段写/清 op（SettingsPathOpView 最小 wire 形态）。 */
+export type ConfigPathOp = { op: 'set'; path: string[]; value: unknown } | { op: 'unset'; path: string[] }
+
+/**
+ * form 最小面（ConfigForm 结构子集：快照 + 订阅 + 字段写/清 + 原子多 op）。
+ * set / unset / mutate 返回 Promise<boolean>：true = Host 接受；false = 拒绝
+ * 或跳写（含 form 内建 latest-write 恢复后）；transport 失败 reject。
+ */
+export interface ConfigFormLike<T> {
+  getSnapshot(): ConfigFormSnapshotLike<T>
   subscribe(listener: () => void): () => void
-  set(field: string, value: unknown): Promise<void>
-  unset(field: string): Promise<void>
+  set(field: string, value: unknown): Promise<boolean>
+  unset(field: string): Promise<boolean>
+  mutate(ops: readonly ConfigPathOp[], expectedRevision?: number): Promise<boolean>
 }
 
-/** 快照 selector hook（框架绑定的 useScope：(sel, eq?) => S）。 */
-export type ScopeSelectorHook = <S>(
-  sel: (s: ScopeSnapshotLike<Config>) => S,
+/** 快照 selector hook（框架绑定的 useForm：(sel, eq?) => S）。 */
+export type FormSelectorHook = <S>(
+  sel: (s: ConfigFormSnapshotLike<Config>) => S,
   eq?: (a: S, b: S) => boolean,
 ) => S
 
-/** 设置卡片 inject 面（hooks 隔间绑定前）：裸 observable + 写回调。 */
+/** 设置卡片 inject 面（hooks 隔间绑定前）：裸 observable form + 写薄封装。 */
 export interface SettingsSectionInject {
-  hooks: { scope: SettingsScopeLike<Config> }
-  setField: (field: string, value: unknown) => Promise<WriteOutcome>
-  resetField: (field: string) => Promise<WriteOutcome>
+  hooks: { form: ConfigFormLike<Config> }
+  setField: (field: string, value: unknown) => Promise<boolean>
+  resetField: (field: string) => Promise<boolean>
 }
 
-/** 设置卡片组件 props（inject 面合成后：hooks.scope 绑成 useScope）。 */
+/** 设置卡片组件 props（inject 面合成后：hooks.form 绑成 useForm）。 */
 export interface CampusHuntSectionProps {
-  /** 框架自 inject `hooks.scope` 隔间绑定的 selector hook。 */
-  useScope: ScopeSelectorHook
-  /** 写一个顶层字段（保存）。 */
-  setField: (field: string, value: unknown) => Promise<WriteOutcome>
-  /** 清一个顶层字段（恢复默认，回 base 层）。 */
-  resetField: (field: string) => Promise<WriteOutcome>
+  /** 框架自 inject `hooks.form` 隔间绑定的 selector hook。 */
+  useForm: FormSelectorHook
+  /** 写一个顶层字段（保存）；false = 未接受。 */
+  setField: (field: string, value: unknown) => Promise<boolean>
+  /** 清一个顶层字段（恢复默认，回 base 层）；false = 未接受。 */
+  resetField: (field: string) => Promise<boolean>
   /** 设置外壳的 owner 面（close）；本卡片不用。 */
   close?: () => void
 }
@@ -235,18 +241,20 @@ const mutedStyle: CSSProperties = { color: '#8a93a6', fontSize: 11 }
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * 设置页卡片（settings.section entry）。渲染只读 useScope selector；
- * 写经 setField / resetField 回调；draft 本地暂存。
+ * 设置页卡片（settings.section entry）。渲染只读 useForm selector；
+ * 写经 setField / resetField 薄封装回调；draft 本地暂存。
  */
 export function CampusHuntSection(props: CampusHuntSectionProps): ReactElement {
-  const status = props.useScope(s => s.status)
-  const value = props.useScope(s => s.value)
-  const user = props.useScope(s => s.user)
-  const writable = props.useScope(s => s.writable)
+  const status = props.useForm(s => s.status)
+  const value = props.useForm(s => s.value)
+  const user = props.useForm(s => s.user)
+  const writable = props.useForm(s => s.writable)
 
   const [draft, setDraft] = useState<Config | null>(null)
   const [busy, setBusy] = useState<TopField | null>(null)
-  const [outcome, setOutcome] = useState<WriteOutcome | null>(null)
+  // 最近一次写未接受（form.set / form.unset 返回 false）：横幅 + draft 归零
+  // 自愈（form 已做 latest-write 镜像恢复，快照为准）。
+  const [writeRefused, setWriteRefused] = useState(false)
 
   if (status === 'loading') {
     return (
@@ -258,7 +266,7 @@ export function CampusHuntSection(props: CampusHuntSectionProps): ReactElement {
   if (status === 'unavailable') {
     return (
       <div style={pageStyle}>
-        <div style={warnStyle}>设置不可用：无法读取 Host 设置文档，或 campus-hunt 分节未注册。</div>
+        <div style={warnStyle}>设置不可用：无法读取 Host 设置文档，或 dsh-campus-hunt 分节未注册。</div>
         <div style={mutedStyle}>请确认 DSH web 服务运行正常，然后重开设置页。</div>
       </div>
     )
@@ -267,7 +275,7 @@ export function CampusHuntSection(props: CampusHuntSectionProps): ReactElement {
     return (
       <div style={pageStyle}>
         <div style={warnStyle}>设置分节解析失败（值与 schema 不一致）。</div>
-        <div style={mutedStyle}>请重启 DSH 让 host 重新注册 campus-hunt 分节后重试。</div>
+        <div style={mutedStyle}>请重启 DSH 让 host 重新注册 dsh-campus-hunt 分节后重试。</div>
       </div>
     )
   }
@@ -276,25 +284,25 @@ export function CampusHuntSection(props: CampusHuntSectionProps): ReactElement {
 
   const isDirty = (field: TopField): boolean => draft !== null && !jsonEqual(draft[field], value[field])
 
-  /** 保存一个顶层字段：写后经 draft 归零回到最新快照；非 ok 显示提示。 */
+  /** 保存一个顶层字段：写后 draft 归零回到最新快照；未接受（false）显示提示。 */
   const doSave = async (field: TopField): Promise<void> => {
     if (draft === null || !isDirty(field)) return
     setBusy(field)
-    setOutcome(null)
-    const r = await props.setField(field, draft[field])
+    setWriteRefused(false)
+    const ok = await props.setField(field, draft[field])
     setDraft(null)
     setBusy(null)
-    if (r !== 'ok') setOutcome(r)
+    if (!ok) setWriteRefused(true)
   }
 
-  /** 恢复默认一个顶层字段（unset，回 base 层）。 */
+  /** 恢复默认一个顶层字段（unset，清 user 层回 base 继承）。 */
   const doReset = async (field: TopField): Promise<void> => {
     setBusy(field)
-    setOutcome(null)
-    const r = await props.resetField(field)
+    setWriteRefused(false)
+    const ok = await props.resetField(field)
     setDraft(null)
     setBusy(null)
-    if (r !== 'ok') setOutcome(r)
+    if (!ok) setWriteRefused(true)
   }
 
   // —— draft 补丁（首次改动即建 draft，未保存不写 scope）——
@@ -344,14 +352,8 @@ export function CampusHuntSection(props: CampusHuntSectionProps): ReactElement {
 
   return (
     <div style={pageStyle}>
-      {outcome !== null && (
-        <div style={warnStyle}>
-          {outcome === 'stale'
-            ? '已有更新，已刷新。请重新确认后再保存。'
-            : outcome === 'timeout'
-              ? '保存超时（值可能已落盘），请重试。'
-              : '保存的值被拒绝（可能超出红线范围或格式不合法），请修正后重试。'}
-        </div>
+      {writeRefused && (
+        <div style={warnStyle}>保存的值被拒绝或已回退（可能超出红线范围或格式不合法），请修正后重试。</div>
       )}
       {!writable && (
         <div style={warnStyle}>设置当前只读：文档不接受写入（非本机页面为 memory 模式，或 Host 拒绝写入）。以下取值仅供参考。</div>

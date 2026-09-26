@@ -1,23 +1,16 @@
 /**
- * dsh-campus-hunt · 回答区岗位卡片会话节点（v0.1.1，client 半场）。
+ * dsh-campus-hunt · 回答区岗位卡片数据面（v0.1.4，client 半场）。
  *
- * 卡片原挂工具调用行（v0.1）；DSH 显示模式 compact（默认）下回合内工具
- * 调用行被折进进程 disclosure，默认不可见。v0.1.1 迁移到
- * 「正式回答区」：注册自定义会话节点 campus-cards（数据面
- * `ctx.uiConversation.events.register` + 渲染面 keyed 槽
- * `conversation.chat.node` key='campus-cards'），锚定在回合末尾——compact /
- * normal 双模式可见（anchor ≥ answerAnchorSeq 不是 process member，host
- * ChatNodeSeat 折叠判据）。
- *
- * 锚定口径（对齐 host DSH 0.1.2-rc.1 turn-tail / turn-process）：
- * - 有文本答案：S + 0.075 —— S = 末条含非空文本的 append-surface
- *   assistant/message 的 seq（host turn-process 的 answerAnchorSeq = S，折叠
- *   窗 [processStartSeq, S) 不含 S+0.075）；S+0.075 恰在答案（S）与 turn
- *   footer 操作行（S+0.1）之间（max-tokens 通知 S+0.05 更靠上）。
- * - 无文本答案：endSeq - 0.05（endSeq = turn/end 的 seq；无文本答案的回合
- *   answerAnchorSeq = null，本来就不折叠）。
- * - 流式期间 buildViewNode 不产出（turn/end 未到达）→ 卡片在回合结束后才
- *   出现（publication 仿 turn-tail：turn/end 'immediate'，其余 'none'）。
+ * 卡片沿革：挂工具调用行（v0.1）→ compact 模式工具行被折叠（v0.1.1）→
+ * 「正式回答区」自定义 chat 节点（buildViewNode + 锚点口径）。v0.1.4 迁
+ * 到 host 0.1.7 的 turn-tail 槽：per-turn Definition 不再物化 chat 节点
+ * ——删除 buildViewNode / 锚点口径，改经 buildLocationData（scope 'turn'）
+ * 发布 turn 作用域 Location 数据：key 'campus-cards'，值 { cards }（现有
+ * 聚合结果：native state.cards ∪ PTC 卫星 step 数据、callId 去重、PTC
+ * content ?? [] 归一，聚合逻辑原样保留）。渲染面（index.tsx）注册
+ * conversation.chat.turnTail 槽，从 owner 的 turn（TurnLocation）读
+ * turn.data.get('campus-cards')——卡片在回合结束后于答案下方 footer 区
+ * 常显，不被「已完成分析 / 用时 xx 秒」操作行折叠。
  *
  * 数据面：只收 4 个 campus 工具（campus_job_search / campus_job_detail /
  * campus_schedule / job_track）已落定（isError !== true、append-surface）的
@@ -26,22 +19,31 @@
  * 口径——call 取自配对 tool/call，使 JobCards GenericRow 的 args 行完整），
  * 复用 JobCards.parseCard——卡片组件本体零改动。
  *
- * v0.1.3（PTC 工具呈现兼容）：host 以 presentAs('ptc') 呈现工具时顶层只暴露
- * run_code，4 个 campus 工具被 pack 成 run_code 内的 tool/ptc-dispatch，
- * campusCardsDefinition 的 match（只认 native tool/call | tool/result）零命中
- * → 无卡。新增卫星 definition campusCardsPtcDefinition（state-only、无
- * target、不物化 view node）：一个 run_code 根调用 = 一个 context（id=callId），
- * 收集其 pack 的 campus 卡片（到达序），经 step 作用域发布 Location 数据
- * （key 'campus-cards-ptc'），由 per-turn definition 在 turn/end 聚合：
- * cards = native state.cards ∪ step location 卡片（并序 = native 在前 + PTC
- * 按 step 序；按 callId 去重；PTC content ?? [] 归一）。native 回合（无
- * run_code → 无卫星数据）引用不变，行为字节不变。native 呈现（顶层
- * tool/call + tool/result 带 data.name）仍走 campusCardsDefinition。
+ * v0.1.3（PTC 工具呈现兼容，零改动）：host 以 presentAs('ptc') 呈现工具时
+ * 顶层只暴露 run_code，4 个 campus 工具被 pack 成 run_code 内的
+ * tool/ptc-dispatch，per-turn match（只认 native tool/call | tool/result）
+ * 零命中 → 无卡。卫星 definition campusCardsPtcDefinition（state-only、无
+ * target、不物化 view node）：一个 run_code 根调用 = 一个 context
+ * （id=callId），收集其 pack 的 campus 卡片（到达序），经 step 作用域发布
+ * Location 数据（key 'campus-cards-ptc'），由 per-turn definition 在
+ * turn/end 聚合进 turn 作用域数据。native 回合（无 run_code → 无卫星
+ * 数据）引用不变，行为字节不变。
+ *
+ * 0.1.7 机制口径（对照 checkout）：
+ * - buildLocationData 由引擎强制 data.key === context.kind、turn / step 为
+ *   有效非负整数；previous 未变须 identity 返回（引擎据此跳过变更）。
+ * - Location 数据 owner 按 (turn, step, key) 唯一：turn 作用域数据每回合
+ *   至多一条（id=turn），与卫星的 step 作用域数据天然不撞。
+ * - flush 事务序：applyDirtyLocationData 先于 buildTargetUpserts → 同一次
+ *   turn/end flush 内 per-turn 可读卫星刚装的 step 数据。
+ * - publication 仅 turn/end 'immediate'：其余事件 'none' → 流式期间不发布
+ *   （turn-tail 只在回合结束渲染，数据在 turn/end flush 一次性到位）。
  *
  * 类型自写口径：本插件不安装 harness client 包（dsh-client-ui-*），下面所有
  * 会话节点 / 会话事件类型均手写最小结构类型（与 index.tsx 的 slots / sessions
- * 同口径），宿主运行时实现注入；本文件纯逻辑（无 React、无副作用），可直接
- * 单测（test/client-campus-cards.test.ts）。
+ * 同口径），宿主运行时实现注入；底部的 declare module 仅为 ConversationTurnDataMap
+ * 键位声明合并保真（ambient，运行时不受影响）。本文件纯逻辑（无 React、
+ * 无副作用），可直接单测（test/client-campus-cards.test.ts）。
  */
 import type { ToolResultNodeLike } from './JobCards.tsx'
 
@@ -102,7 +104,7 @@ export interface CardMatch {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 状态与节点数据
+// 状态与 Location 数据
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** 一个回合内已记录的 tool/call（仅 4 个 campus 工具）。 */
@@ -123,30 +125,48 @@ export interface CampusCardsState {
   readonly turn: number
   readonly calls: ReadonlyMap<string, CampusCardCall>
   readonly cards: readonly CampusCardEntry[]
-  /** S：末条含非空文本的 append-surface assistant/message 的 seq（undefined = 无文本答案）。 */
-  readonly textSeq: number | undefined
-  /** turn/end 的 seq（undefined = 回合未结束）。 */
+  /** turn/end 的 seq（undefined = 回合未结束，buildLocationData 不发布）。 */
   readonly endSeq: number | undefined
 }
 
-/** 卡片节点数据（渲染面只读这份）。 */
-export interface CampusCardsNodeData {
+/** turn 作用域 Location 数据值（key 'campus-cards' 下发布；渲染面只读这份）。 */
+export interface CampusCardsTurnLocationData {
   readonly cards: readonly CampusCardEntry[]
 }
 
-/** campus-cards Chat 节点（host ChatNode 子集，多余字段 wire 上被忽略）。 */
-export interface CampusCardsChatNode {
-  readonly key: string
-  readonly kind: 'campus-cards'
-  readonly id: string
-  readonly target: 'chat'
-  readonly anchorSeq: number
-  readonly location: CardLocation
-  readonly visibility: 'visible'
-  readonly data: CampusCardsNodeData
+/** Location 数据记录（host ConversationLocationData 泛型形态子集；turn 分支）。 */
+export interface CampusCardsTurnLocationDataRecord {
+  readonly kind: 'turn'
+  readonly turn: number
+  readonly key: 'campus-cards'
+  readonly value: CampusCardsTurnLocationData
 }
 
-/** 最小上下文切片（只读 key / id / start / matches / state）。 */
+/** buildLocationData 的 previous 参（手写超类型：host 任意已注册记录结构可赋值）。 */
+export interface CampusCardsLocationDataPrevious {
+  readonly kind: string
+  readonly turn: number
+  readonly step?: number
+  readonly key: string
+  readonly value: unknown
+}
+
+/**
+ * 声明合并口径（对照 host ui-deliverables turn-deliverables.ts）：把
+ * 'campus-cards' 键登记进 ConversationTurnDataMap，turn.data 读方按键拿
+ * 类型。本插件未安装 dsh-client-ui-conversation，ambient 声明只保类型保真，
+ * 运行时不受影响（渲染面仍自写最小读面）。
+ */
+declare module '@deepseek-ai/dsh-client-ui-conversation/client' {
+  interface ConversationTurnDataMap {
+    /** 本回合 4 个 campus 工具已落定卡片（native ∪ PTC 卫星聚合，callId 去重）。 */
+    'campus-cards': CampusCardsTurnLocationData
+  }
+}
+
+/**
+ * 最小上下文切片（只读 key / id / start / matches / state）。
+ */
 export interface CampusCardsContext {
   readonly key: string
   readonly id: string
@@ -157,17 +177,21 @@ export interface CampusCardsContext {
 }
 
 /**
- * conversation 节点 definition（host ConversationNodeDefinition 子集；结构
- * 兼容口径：参数类型均为 host 类型的超类型，返回值均为 host 类型的子集）。
+ * conversation 节点 definition（host ConversationNodeDefinition 子集；
+ * state-only：无 target，不物化 view node；结构兼容口径：参数类型均为 host
+ * 类型的超类型，返回值均为 host 类型的子集）。
  */
 export interface CampusCardsDefinition {
   readonly kind: 'campus-cards'
-  readonly target: 'chat'
   readonly match: (event: CardEvent) => { id: string; role: 'start' | 'update' } | null
   readonly start: (context: CampusCardsContext, match: CardMatch) => CampusCardsState
   readonly update: (context: CampusCardsContext & { state: CampusCardsState }, match: CardMatch) => CampusCardsState
   readonly publication: (match: CardMatch) => 'none' | 'immediate'
-  readonly buildViewNode: (context: CampusCardsContext) => CampusCardsChatNode | null
+  readonly buildLocationData: (
+    context: CampusCardsContext,
+    scope: 'step' | 'turn',
+    previous: CampusCardsLocationDataPrevious | null,
+  ) => CampusCardsTurnLocationDataRecord | null
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -188,32 +212,11 @@ function eventTurn(event: CardEvent): number | undefined {
   return safeInt(asRecord(event.data)?.turn)
 }
 
-/** assistant/message 是否含非空文本（host turn-tail hasTextAssistant 同口径）。 */
-function messageHasText(event: CardEvent): boolean {
-  const message = asRecord(event.data)?.message
-  const content = asRecord(message)?.content
-  if (!Array.isArray(content)) return false
-  return content.some(block => {
-    const r = asRecord(block)
-    return r !== null && r.type === 'text' && typeof r.text === 'string' && r.text.trim() !== ''
-  })
-}
-
 /**
- * 锚定 seq（host turn-tail / turn-process 对齐）：有文本答案 S+0.075，
- * 否则 endSeq-0.05；回合未结束（endSeq undefined）→ null（buildViewNode
- * 不产出）。
- */
-export function cardAnchorSeq(state: CampusCardsState): number | null {
-  if (state.endSeq === undefined) return null
-  return state.textSeq !== undefined ? state.textSeq + 0.075 : state.endSeq - 0.05
-}
-
-/**
- * 从 turn 位置读 PTC 卫星卡片（v0.1.3 聚合读取路径）：buildViewNode 只在
- * endSeq 已定义时产出 → 末 match 必为 turn/end → 其 location（kind 'turn'）
- * 的 steps 为当前全量；按 step 序 data.get('campus-cards-ptc') → { cards }；
- * 缺席 / 畸形（非对象、cards 非数组）按无处理。
+ * 从 turn 位置读 PTC 卫星卡片（v0.1.3 聚合读取路径）：buildLocationData
+ * 只在 endSeq 已定义时发布 → 末 match 必为 turn/end → 其 location（kind
+ * 'turn'）的 steps 为当前全量；按 step 序 data.get('campus-cards-ptc') →
+ * { cards }；缺席 / 畸形（非对象、cards 非数组）按无处理。
  */
 function ptcCardsFromTurnLocation(location: CardLocation): CampusPtcCardBlock[] {
   if (location.kind !== 'turn' || location.turn === undefined) return []
@@ -263,12 +266,11 @@ function aggregateTurnCards(state: CampusCardsState, matches: readonly CardMatch
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// definition 本体
+// per-turn definition 本体（turn 作用域 Location 数据；v0.1.4）
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const campusCardsDefinition: CampusCardsDefinition = {
   kind: 'campus-cards',
-  target: 'chat',
   match: (event) => {
     const turn = eventTurn(event)
     if (turn === undefined) return null
@@ -276,11 +278,6 @@ export const campusCardsDefinition: CampusCardsDefinition = {
     if (event.type === 'tool/call') return { id: String(turn), role: 'update' }
     if (event.type === 'tool/result') {
       return event.surfaceOp === 'append' ? { id: String(turn), role: 'update' } : null
-    }
-    if (event.type === 'assistant/message') {
-      return event.surfaceOp === 'append' && messageHasText(event)
-        ? { id: String(turn), role: 'update' }
-        : null
     }
     if (event.type === 'turn/end') return { id: String(turn), role: 'update' }
     return null
@@ -293,7 +290,6 @@ export const campusCardsDefinition: CampusCardsDefinition = {
       turn,
       calls: new Map(),
       cards: [],
-      textSeq: undefined,
       endSeq: undefined,
     }
   },
@@ -341,10 +337,6 @@ export const campusCardsDefinition: CampusCardsDefinition = {
       return { ...state, cards: [...state.cards, { callId, tool: call.tool, block }] }
     }
 
-    if (event.type === 'assistant/message') {
-      return { ...state, textSeq: event.seq }
-    }
-
     if (event.type === 'turn/end') {
       return { ...state, endSeq: event.seq }
     }
@@ -352,41 +344,35 @@ export const campusCardsDefinition: CampusCardsDefinition = {
     return state
   },
   publication: (match) => (match.event.type === 'turn/end' ? 'immediate' : 'none'),
-  buildViewNode: (context) => {
+  buildLocationData: (context, scope, previous) => {
+    if (scope !== 'turn') return null
     const state = context.state
-    if (state === undefined) return null
-    const anchor = cardAnchorSeq(state)
-    if (anchor === null) return null
+    // 流式期间（turn/end 未到）不发布：turn-tail 只在回合结束渲染。
+    if (state === undefined || state.endSeq === undefined) return null
     // v0.1.3 聚合：native ∪ PTC 卫星 step location 卡片（末 match 必为
     // turn/end，其 location.steps 为当前全量）。
     const cards = aggregateTurnCards(state, context.matches)
     if (cards.length === 0) return null
-    return {
-      key: context.key,
-      kind: 'campus-cards',
-      id: context.id,
-      target: 'chat',
-      anchorSeq: anchor,
-      location: context.start?.location ?? { kind: 'unresolved' },
-      visibility: 'visible',
-      data: { cards },
+    if (previous !== null && previous.kind === 'turn' && previous.key === 'campus-cards') {
+      const value = asRecord(previous.value)
+      // cards 引用未变 → identity 返回 previous（引擎跳过变更）。
+      if (value !== null && value.cards === cards) return previous as CampusCardsTurnLocationDataRecord
     }
+    return { kind: 'turn', turn: state.turn, key: 'campus-cards', value: { cards } }
   },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PTC 卫星 definition（v0.1.3；state-only，无 target，不物化 view node）
 //
-// host 0.1.5-rc.2 机制口径（对照 checkout）：
+// 0.1.7 机制口径（对照 checkout）：
 // - 一个 context id 只允许一个 start → 卫星以 run_code 根调用 callId 为 id
 //   （不能并入 per-turn context，id=turn 会重复 start）。
-// - buildLocationData 由引擎强制 data.key === context.kind、turn / step 为
-//   有效非负整数；previous 未变须 identity 返回（引擎据此跳过变更）。
 // - Location 数据 owner 按 (turn, step, key) 唯一 → 必须发 step 作用域
 //   （每 step 至多一个 run_code 根调用 → 每 step 一个卫星，天然不撞；turn
 //   作用域下同回合多次 run_code 会撞）。
-// - flush 事务序：applyDirtyLocationData 先于 buildTargetUpserts → 同一次
-//   turn/end flush 内 per-turn 节点可读卫星刚装的 step 数据。
+// - 卫星数据只被 per-turn definition 在 turn/end flush 聚合消费（同 flush
+//   内先装 location 数据再 build）→ publication 恒 none。
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** PTC pack 卡片 block（host tool.ts childResult 口径，本插件所需字段子集）。 */
@@ -528,8 +514,6 @@ export const campusCardsPtcDefinition: CampusPtcDefinition = {
     }
     return { ...state, cards: [...state.cards, block] }
   },
-  // 卫星无 view node；step 数据只被 per-turn 节点在 turn/end flush 消费
-  // （同 flush 内先装 location 数据再 build upsert）→ 无需立即 flush。
   publication: () => 'none',
   buildLocationData: (context, scope, previous) => {
     if (scope !== 'step') return null

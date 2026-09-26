@@ -7,7 +7,7 @@
 > local-first data layer, read-only collection.
 
 ## Latest Version
-**v0.1.1**
+**v0.1.4**
 
 ## Introduction
 

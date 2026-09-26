@@ -11,10 +11,26 @@
  *
  * Config 双重身份：同名导出既是 settings namespace 的校验模式，也是 cordis
  * entry `config:` 的校验模式（cordis loader 以 StandardSchema v1 校验 entry
- * 值并把解析结果作为 apply 第二参）；installSection 以同一 entry 值作
- * settings 组合 base 层。用户改动落 $DSH_HOME/settings.yaml 的 campus-hunt
- * 分节（settings 服务机制），每次解析 = 模式默认 → base → 用户层，经
- * setSource 接通 currentConfig()。
+ * 值并把解析结果作为 apply 第二参）。
+ *
+ * v0.1.4（0.1.7 settings 模型）：installSection 废弃——namespace 由 entry
+ * config schema 自动派生（ns = entry id 'dsh-campus-hunt'，见 src/ns.ts）；
+ * 配置源 = entry 值（apply 初值）+ 活重读（src/index.ts）：settings 服务
+ * （可选，经 ctx.get 读取）在场时订阅 'settings/document-updated'（按 ns
+ * 过滤）与 'app-boot/config-reload'，重读 settings.describe({
+ * redactSecrets: false }) 中 ns === NS 条目的 .value（entry 解析值 =
+ * inherited + profile patch），经 Config 模式校验（resolveEntryValue）后
+ * setSource；entry 未投影或校验失败 → 保持当前源（fail-loud，不静默吞）；
+ * 值与当前源相同 → no-op。用户改动落 $DSH_HOME 的 profile patch
+ * （settings 服务机制）。
+ *
+ * v0.1.4 volatile 口径：4 个顶层字段（profile / resumePath / specialUrl /
+ * collection）标 .default(...).volatile()——settings describe 的 entry
+ * 投影门（volatileForm：无 volatile 标记的 entry 不投影，插件 ns 未服务）；
+ * 解析值为 cosmokit Volatile 活引用（frozen 对象 { get(): 不可变快照 }）。
+ * 插件无 cosmokit 直依，边界（apply 第二参 / resolveEntryValue）经
+ * toSourceConfig 逐字段 .get() 解包为 plain 可变 Config；.get() 每次读取
+ * 取当前值，文档变更时活引用由宿主原位更新，故 currentConfig() 恒新鲜。
  *
  * 红线 clamp（规格 §4.1）：maxItemsPerRun 只允许 ≤50、minIntervalMs 只允许
  * ≥1000（上限 600000）——模式边界即 clamp：放松红线的值在加载/解析时拒绝
@@ -24,7 +40,8 @@
  * 直开入口），http(s) URL 格式校验（非法值解析时拒绝，与红线同口径）。
  *
  * settings 服务可选：host 顶层 inject 保持 ['tools','skills']；apply 内经
- * ctx.inject(['settings'], ...) 瀑布挂载（provider 缺席时跳过，不挂起）。
+ * ctx.get('settings') 读取（provider 缺席时源保持 entry 值，apply 同步
+ * 返回不挂起）。
  */
 
 // 同文件 import cordis 的 Context（type 别名引用即可）是下方 declare module
@@ -34,27 +51,31 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 
 /**
- * Settings 服务注册面（宿主 dsh-settings 服务；插件不直接依赖该包——与
- * skill 注册面声明同模式，只声明本插件用到的 installSection 面，契约与
- * SettingsProvider.installSection 一致：owner/ns/schema/entry/hooks
- * {setSource, onChange, validate?}）。
+ * Settings 服务最小自类型（宿主 dsh-settings 的 SettingsForms 服务；插件不
+ * 依赖 dsh-settings 包——与 skill 注册面声明同模式，只声明本插件活重读用到
+ * 的 describe 面与两个订阅事件）。
  */
 declare module '@deepseek-ai/cordis' {
   interface Context {
-    /** Settings 服务（仅经 ctx.inject(['settings']) 瀑布使用）。 */
+    /** Settings 服务（可选：provider 未挂载时 ctx.get('settings') 为 undefined）。 */
     settings: {
-      installSection<T>(
-        owner: Context,
-        ns: string,
-        schema: unknown,
-        entry: T,
-        hooks: {
-          setSource(current: () => T): void
-          onChange(): void
-          validate?: (value: T) => void
-        },
-      ): void
+      /**
+       * 读取活跃插件 schema 与其活值。
+       * @param options - redact 选项（活重读传 redactSecrets: false 取未脱敏活值）。
+       * @returns 每 entry id 一条：ns = entry id，value = entry 解析值（inherited + profile patch，unknown 来源）。
+       */
+      describe(options?: { redactSecrets?: boolean }): Array<{
+        ns: string
+        value: unknown
+        revision: number
+      }>
     }
+  }
+  interface Events {
+    /** Settings 文档更新：settings 服务在某 ns 的 entry 投影变化时 emit (ns, revision)。 */
+    'settings/document-updated'(ns: string, revision: number): void
+    /** App-boot 配置重载：宿主配置变更重新进入时 emit。 */
+    'app-boot/config-reload'(): void
   }
 }
 
@@ -117,20 +138,56 @@ const collectionShape = {
  * 配置校验模式（settings namespace schema + cordis entry config 校验）。
  * 每字段带 default：entry 或用户层缺键时按默认补齐。
  */
-export const Config: z<Config> = z.object({
-  profile: z.object(profileShape).default({ directions: [], cities: [], targetCompanies: [] }),
-  resumePath: z.string().default(''),
+export const Config = z.object({
+  profile: z.object(profileShape).default({ directions: [], cities: [], targetCompanies: [] }).volatile(),
+  resumePath: z.string().default('').volatile(),
   // v0.1.1：http(s) URL 格式校验（schemastery 无 refine 回调，取 .pattern
   // 表达；非法值解析时拒绝，与红线同口径）。
-  specialUrl: z.string().min(1).pattern(/^https?:\/\/\S+$/).default(DEFAULT_SPECIAL_URL),
+  specialUrl: z.string().min(1).pattern(/^https?:\/\/\S+$/).default(DEFAULT_SPECIAL_URL).volatile(),
   collection: z.object(collectionShape).default({
     allowedDomains: ['nowcoder.com'],
     maxItemsPerRun: 50,
     minIntervalMs: 1000,
-  }),
+  }).volatile(),
 })
 
 // ---- 当前配置源线（setSource 模式，cookbook）----
+
+/** volatile 字段快照（递归 readonly；cosmokit VolatileSnapshot 的最小自类型，插件无 cosmokit 直依）。 */
+export type ReadSnapshot<T> = T extends object ? { readonly [K in keyof T]: ReadSnapshot<T[K]> } : T
+/** volatile 字段的活引用读面（cosmokit Volatile 协议）。 */
+export type Live<T> = { get(): ReadSnapshot<T> }
+/** entry 解析值（4 个顶层字段为 volatile 活引用，其余形态与 Config 一致）。 */
+export interface EntryLive {
+  profile: Live<Config['profile']>
+  resumePath: Live<string>
+  specialUrl: Live<string>
+  collection: Live<Config['collection']>
+}
+/**
+ * 把 entry 解析值（volatile 活引用）解包为 plain 可变 Config 快照：逐字段
+ * .get() 取当前不可变快照后显式拷贝（数组 [...展开]，标量直取）。
+ * @param value - apply 第二参或 z.resolve 输出（4 字段为活引用）。
+ * @returns 与活引用解耦的 plain Config（每次调用取当前值）。
+ */
+export function toSourceConfig(value: EntryLive): Config {
+  const profile = value.profile.get()
+  const collection = value.collection.get()
+  return {
+    profile: {
+      directions: [...profile.directions],
+      cities: [...profile.cities],
+      targetCompanies: [...profile.targetCompanies],
+    },
+    resumePath: value.resumePath.get(),
+    specialUrl: value.specialUrl.get(),
+    collection: {
+      allowedDomains: [...collection.allowedDomains],
+      maxItemsPerRun: collection.maxItemsPerRun,
+      minIntervalMs: collection.minIntervalMs,
+    },
+  }
+}
 
 let source: () => Config = () => defaultConfig
 
@@ -146,6 +203,20 @@ export function setSource(next: () => Config): void {
 /** 当前配置（工具 execute 每次运行读取 → 配置改动下次运行即时生效）。 */
 export function currentConfig(): Config {
   return source()
+}
+
+/**
+ * 把 settings describe 的 entry 值（unknown 来源，如 profile patch 投影）经
+ * Config 模式解析为 Config（schemastery 的 resolve 静态方法——与 cordis
+ * loader 的 entry 校验同一解析口径）：缺键按默认补齐，红线 clamp 与
+ * specialUrl 格式在解析失败时抛错（调用方保持当前源并告警，fail-loud 不
+ * 静默吞）。
+ * @param value - describe 返回的 ns === NS 条目的 .value。
+ * @returns 经 Config 模式校验的完整配置。
+ */
+export function resolveEntryValue(value: unknown): Config {
+  const resolved = z.resolve(value, Config, {})[0]
+  return toSourceConfig(resolved)
 }
 
 // ---- 域名白名单 ----

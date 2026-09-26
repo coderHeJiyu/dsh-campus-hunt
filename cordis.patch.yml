@@ -8,8 +8,10 @@
 - insert:
     - id: dsh-campus-hunt
       name: 'dsh-campus-hunt'
-      # v0.1 SFE6：entry 配置 = settings namespace campus-hunt 的 base 层
-      # （与 src/config.ts defaultConfig 同值；用户改动落 $DSH_HOME/settings.yaml）。
+      # v0.1.4：0.1.7 自动 namespace——settings ns = entry id 'dsh-campus-hunt'
+      # （与下方 id 同值，src/ns.ts 单一来源）；entry 配置为该 namespace 的
+      # base 层（与 src/config.ts defaultConfig 同值；用户改动落 $DSH_HOME
+      # profile patch）。
       config:
         profile:
           directions: []

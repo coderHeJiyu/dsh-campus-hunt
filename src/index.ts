@@ -7,12 +7,15 @@ import { buildCampusHuntSkill } from './skill/campus-hunt.skill.ts'
 import { PLUGIN_VERSION } from './version.ts'
 import {
   Config,
+  EntryLive,
   NS,
   currentConfig,
+  resolveEntryValue,
   setSource,
+  toSourceConfig,
 } from './config.ts'
 
-export { Config, NS, currentConfig, setSource }
+export { Config, NS, currentConfig, resolveEntryValue, setSource }
 export { defaultConfig, isDomainAllowed } from './config.ts'
 export { PLUGIN_VERSION } from './version.ts'
 
@@ -32,33 +35,37 @@ export { PLUGIN_VERSION } from './version.ts'
  * client 半场（src/client/）以会话节点 campus-cards 在回答区注册三 tab
  * 卡片（v0.1.1）。
  * v0.1：settings 半场——Config（schemastery）双重身份（cordis entry
- * `config:` 校验 + settings namespace `campus-hunt` 模式）；apply 接收 entry
- * 配置、经 ctx.inject(['settings']) 瀑布 installSection（provider 缺席时
- * 跳过）；3 个采集工具（search/detail/schedule）消费采集红线（截断 /
+ * `config:` 校验 + settings namespace 模式）；apply 接收 entry 配置；
+ * 3 个采集工具（search/detail/schedule）消费采集红线（截断 /
  * 域名白名单，job_track 不消费采集配置）；skill 改工厂，红线两行随配置
- * 参数化，onChange best-effort 重注册（同 id runtime skill first-wins：先
- * dispose 再注册）。
+ * 参数化，best-effort 重注册（同 id runtime skill first-wins：先 dispose
+ * 再注册，content 不变 no-op）。
  * v0.1.1（画像直供）：profile.json 物化（syncProfile）废弃——求职画像
- * 只存 settings 的 campus-hunt 分节、无 workspace 副本；free-search 模式
- * （host 侧每次 execute 活读 currentConfig()）下由 campus_job_search 返回行
- * 直供模型。
+ * 只存 settings 分节、无 workspace 副本；free-search 模式（host 侧每次
+ * execute 活读 currentConfig()）下由 campus_job_search 返回行直供模型。
+ * v0.1.4（0.1.7 settings 模型）：installSection 废弃——namespace 由 entry
+ * config schema 自动派生（ns = entry id 'dsh-campus-hunt'，D1）；apply 经
+ * ctx.get('settings') 读可选服务（缺席时源保持 entry 值、同步返回不挂起），
+ * 在场时订阅 'settings/document-updated'（按 ns 过滤）+ 'app-boot/config-
+ * reload' 活重读：describe({ redactSecrets: false }) 的 NS 条目 .value 经
+ * Config 模式校验后 setSource（值与当前源不同才换源 + skill 重注册）。
  * 数据层 local-first（workspace 下 3 个数据文件：jobs.json / track.json /
  * schedule.json，schema v0）。
  */
 export const name = 'dsh-campus-hunt'
 export const inject = ['tools', 'skills']
 
-export function apply(ctx: Context, config: Config): void {
-  // entry 配置即初始权威源（settings 挂载后被 installSection 的 setSource
-  // 换成 settings 解析值；工具 execute 每次运行读 currentConfig()）。
-  setSource(() => config)
+export function apply(ctx: Context, config: EntryLive): void {
+  // entry 配置即初始权威源（v0.1.4：settings 服务在场时经活重读把 entry
+  // 解析值 setSource 换上；工具 execute 每次运行读 currentConfig()）。
+  setSource(() => toSourceConfig(config))
 
   ctx.tools.register(jobTrackTool)
   ctx.tools.register(campusJobSearchTool)
   ctx.tools.register(campusJobDetailTool)
   ctx.tools.register(campusScheduleTool)
 
-  // skill：按当前配置构建；settings 变更时 best-effort 重注册。
+  // skill：按当前配置构建；配置变更时 best-effort 重注册。
   // 宿主语义（dsh-skill）：同层同 id runtime skill first-wins——重复 register
   // 只告警 + no-op disposer，不替换不抛错；故先 dispose 旧注册（清掉层内
   // 条目）再 register 新值。dispose 后若 id 仍被他人占着（本插件独占
@@ -67,20 +74,50 @@ export function apply(ctx: Context, config: Config): void {
   let skillContent = initialSkill.content
   let disposeSkill = ctx.skills.register(initialSkill)
 
-  // settings 服务可选：provider 未挂载时瀑布跳过本回调，配置源保持 entry 值。
-  ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, NS, Config, config, {
-      setSource,
-      onChange: () => {
-        const next = buildCampusHuntSkill(currentConfig())
-        if (next.content !== skillContent) {
-          disposeSkill()
-          skillContent = next.content
-          disposeSkill = ctx.skills.register(next)
-        }
-      },
+  const resyncSkill = (): void => {
+    const next = buildCampusHuntSkill(currentConfig())
+    if (next.content !== skillContent) {
+      disposeSkill()
+      skillContent = next.content
+      disposeSkill = ctx.skills.register(next)
+    }
+  }
+
+  // settings 服务可选（宿主口径：可选服务经 ctx.get 读取）：provider 未挂载
+  // 时配置源保持 entry 值、apply 同步返回不挂起（v0.1 口径延续）。
+  const settings = ctx.get('settings')
+  if (settings !== undefined) {
+    // 活重读：describe → 取 ns === NS 条目的 .value（entry 解析值）→ 经
+    // Config 模式校验 → 与当前源不同才 setSource + skill 重注册。entry 未
+    // 投影或校验失败 → 保持当前源（fail-loud，不静默吞）。
+    const reread = (): void => {
+      let descriptors: Array<{ ns: string; value: unknown; revision: number }>
+      try {
+        descriptors = settings.describe({ redactSecrets: false })
+      } catch (error) {
+        console.warn('[dsh-campus-hunt] settings.describe 失败，保持当前配置源：', error)
+        return
+      }
+      const entry = descriptors.find((d) => d.ns === NS)
+      if (entry === undefined) return // entry 未投影：保持当前源
+      let parsed: Config
+      try {
+        parsed = resolveEntryValue(entry.value)
+      } catch (error) {
+        console.warn('[dsh-campus-hunt] entry 值未通过 Config 校验，保持当前配置源：', error)
+        return
+      }
+      if (JSON.stringify(parsed) === JSON.stringify(currentConfig())) return // 值未变 → no-op
+      setSource(() => parsed)
+      resyncSkill()
+    }
+    ctx.on('settings/document-updated', (ns, _revision) => {
+      if (ns === NS) reread()
     })
-  })
+    ctx.on('app-boot/config-reload', () => {
+      reread()
+    })
+  }
 
   // 版本号单一来源在 src/version.ts（内联自包根 package.json 的 version），bump 后重建即同步。
   console.log(`[dsh-campus-hunt] job_track + campus_job_search + campus_job_detail + campus_schedule + campus-hunt skill registered (v${PLUGIN_VERSION})`)
